@@ -137,6 +137,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.authz_mixin import _coerce_allow_set
+from gateway.telegram_recovery_queue import TelegramRecoveryQueue
 from agent.i18n import get_language, t
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
@@ -585,6 +586,8 @@ class TelegramAdapter(BasePlatformAdapter):
         # Resolved now: secondary profiles construct adapters inside their own home scope.
         from hermes_constants import get_hermes_home
         self._update_receipt_dir = get_hermes_home()
+        # Fixed per-profile recovery storage; no gateway configuration is consulted.
+        self._telegram_recovery_queue_home = get_hermes_home()
         self._update_receipts_loaded: set = set()
         self._update_receipts_dirty: set = set()
         self._update_receipt_flush: Optional[asyncio.Task] = None
@@ -1089,6 +1092,57 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         # Unauthorized DM the gateway would pair: forward so pairing can run.
         return self._should_pass_unauthorized_dm_for_pairing(source)
+
+    def _explicit_recovery_allowlist_match(self, message: Message) -> bool:
+        """True only for an exact sender ID in this adapter's configured allowlist.
+
+        This deliberately does not honor wildcard entries, environment grants, runner
+        authorization, chat allowlists, or pairing.  Recovery storage is therefore
+        narrower than normal admission and cannot become an alternate auth path.
+        """
+        source = self._source_from_message_for_auth(message)
+        if not source.user_id:
+            return False
+        is_group = (source.chat_type or "") in ("group", "forum", "channel")
+        extra = getattr(getattr(self, "config", None), "extra", None) or {}
+        configured = extra.get("group_allow_from" if is_group else "allow_from")
+        if configured is None:
+            return False
+        return source.user_id in _coerce_allow_set(configured)
+
+    async def _queue_rejected_message(self, message: Message, update: Update, message_type: MessageType) -> None:
+        """Best-effort local retention for explicitly configured senders only.
+
+        No event is built here, so this path cannot create a session, process a
+        turn, reply, observe group context, or download media.  Media references are
+        intentionally empty because rejection occurs before Telegram media caching.
+        """
+        try:
+            if not self._explicit_recovery_allowlist_match(message):
+                return
+            source = self._source_from_message_for_auth(message)
+            message_id = str(getattr(message, "message_id", "") or "")
+            if not source.chat_id or not source.user_id or not message_id:
+                return
+            profile_home = getattr(self, "_telegram_recovery_queue_home", None)
+            if profile_home is None:
+                from hermes_constants import get_hermes_home
+                profile_home = get_hermes_home()
+            queued = await asyncio.to_thread(
+                TelegramRecoveryQueue(profile_home).enqueue,
+                chat_id=source.chat_id,
+                sender_id=source.user_id,
+                message_id=message_id,
+                message_type=message_type.value,
+                text=getattr(message, "text", None) or getattr(message, "caption", None) or "",
+                platform_update_id=getattr(update, "update_id", None),
+                media_paths=(),
+            )
+            if queued:
+                logger.info("[Telegram] Retained rejected allowlisted message for local recovery")
+        except Exception:
+            # Admission remains fail-closed even if private recovery storage is unavailable.
+            logger.warning("[Telegram] Failed to retain rejected message for local recovery", exc_info=True)
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -6508,12 +6562,14 @@ class TelegramAdapter(BasePlatformAdapter):
             level, "[Telegram] Blocked %s %s in chat %s", what, getattr(getattr(msg, "from_user", None), "id", None),
             getattr(getattr(msg, "chat", None), "id", None))
 
-    def _gate_or_observe(self, msg, update, msg_type: MessageType) -> bool:
-        """Group trigger gate; observes unmentioned chatter when configured. True = proceed."""
+    async def _gate_or_observe(self, msg, update, msg_type: MessageType) -> bool:
+        """Group trigger gate; observe admitted context or retain eligible rejected input."""
         if self._should_process_message(msg):
             return True
         if self._should_observe_unmentioned_group_message(msg):
             self._observe_unmentioned_group_message(msg, msg_type, update_id=update.update_id)
+        else:
+            await self._queue_rejected_message(msg, update, msg_type)
         return False
 
     async def _build_triggered_event(self, msg, update, msg_type: MessageType) -> MessageEvent:
@@ -6532,9 +6588,10 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         # Auth check first: blocked users must not reach batching, the observed transcript, or the agent.
         if not self._is_user_authorized_from_message(msg):
+            await self._queue_rejected_message(msg, update, MessageType.TEXT)
             self._log_blocked_user(msg)
             return
-        if not self._gate_or_observe(msg, update, MessageType.TEXT):
+        if not await self._gate_or_observe(msg, update, MessageType.TEXT):
             return
         await self._ensure_forum_commands(update.message)
         self._enqueue_text_event(await self._build_triggered_event(msg, update, MessageType.TEXT))
@@ -6544,10 +6601,12 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
-        if not self._should_process_message(msg, is_command=True):
-            return
         if not self._is_user_authorized_from_message(msg):
+            await self._queue_rejected_message(msg, update, MessageType.COMMAND)
             self._log_blocked_user(msg)
+            return
+        if not self._should_process_message(msg, is_command=True):
+            await self._queue_rejected_message(msg, update, MessageType.COMMAND)
             return
         await self._ensure_forum_commands(msg)
         event = await self._build_triggered_event(msg, update, MessageType.COMMAND)
@@ -6564,9 +6623,10 @@ class TelegramAdapter(BasePlatformAdapter):
         if not msg:
             return
         if not self._is_user_authorized_from_message(msg):
+            await self._queue_rejected_message(msg, update, MessageType.LOCATION)
             self._log_blocked_user(msg)
             return
-        if not self._gate_or_observe(msg, update, MessageType.LOCATION):
+        if not await self._gate_or_observe(msg, update, MessageType.LOCATION):
             return
         venue = getattr(msg, "venue", None)
         location = getattr(venue, "location", None) if venue else getattr(msg, "location", None)
@@ -6844,6 +6904,7 @@ class TelegramAdapter(BasePlatformAdapter):
         if not msg:
             return
         if not self._is_user_authorized_from_message(msg):
+            await self._queue_rejected_message(msg, update, self._media_message_type(msg))
             self._log_blocked_user(msg, level=logging.INFO, what="media from unauthorized user")
             return
         if not self._should_process_message(msg):
@@ -6853,6 +6914,8 @@ class TelegramAdapter(BasePlatformAdapter):
                     _event.text = self._clean_bot_trigger_text(expand_link_entities(msg))
                 await self._cache_observed_media(msg, _event)
                 self._observe_unmentioned_group_message(msg, _event.message_type, update_id=update.update_id, event=_event)
+            else:
+                await self._queue_rejected_message(msg, update, self._media_message_type(msg))
             return
         event = self._build_message_event(msg, self._media_message_type(msg), update_id=update.update_id)
         if msg.caption:

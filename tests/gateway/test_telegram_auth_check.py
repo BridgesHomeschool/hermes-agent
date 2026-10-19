@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.event import MessageType
 
 
 def _make_adapter(allow_from=None, allowed_chats=None, group_allowed_chats=None, callback_auth=None, **extra_overrides):
@@ -68,6 +69,41 @@ def _make_message(text="hello", *, from_user_id=111, chat_id=-100, chat_type="gr
         sticker=None,
         media_group_id=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_rejected_explicitly_allowlisted_group_message_is_recovered_without_a_session(tmp_path):
+    """A mention-gated allowed sender is retained locally, never dispatched or replied to."""
+    from gateway.telegram_recovery_queue import TelegramRecoveryQueue
+
+    adapter = _make_adapter(group_allow_from=["101"])
+    adapter._telegram_recovery_queue_home = tmp_path
+    adapter._should_process_message = lambda *args, **kwargs: False
+    adapter.handle_message = AsyncMock()
+    message = _make_message(text="recovery body", from_user_id=101, chat_type="group")
+    update = SimpleNamespace(update_id=1, message=message, effective_message=None)
+
+    await adapter._handle_text_message(update, SimpleNamespace())
+
+    adapter.handle_message.assert_not_awaited()
+    entries = TelegramRecoveryQueue(tmp_path).read()
+    assert len(entries) == 1
+    assert entries[0]["media_paths"] == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_queue_never_retains_non_explicit_sender(tmp_path):
+    """A sender outside the exact configured list cannot enter recovery storage."""
+    from gateway.telegram_recovery_queue import TelegramRecoveryQueue
+
+    adapter = _make_adapter(group_allow_from=["101"])
+    adapter._telegram_recovery_queue_home = tmp_path
+    message = _make_message(text="not retained", from_user_id=202, chat_type="group")
+    update = SimpleNamespace(update_id=1, message=message, effective_message=None)
+
+    await adapter._queue_rejected_message(message, update, MessageType.TEXT)
+
+    assert TelegramRecoveryQueue(tmp_path).read() == []
 
 
 @pytest.mark.asyncio
