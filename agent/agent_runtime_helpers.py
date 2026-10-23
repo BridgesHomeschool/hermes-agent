@@ -550,11 +550,17 @@ def _drop_stray_tool_results(messages: List[Dict]) -> Tuple[List[Dict], int]:
                 # receipt. Alias consumption cannot disprove a legacy attempt.
                 filtered.append(msg)
                 continue
-            candidate_groups = {
+            alias_groups = {
                 group for (tc_id, call_uid), group in known_tool_ids.items()
                 if tc_id in result_variants and (not uid or call_uid == uid)
-                and group not in matched_tool_groups
             }
+            if not uid and len(alias_groups) > 1:
+                # Keep an unattributed receipt without assigning it to an arbitrary
+                # occurrence. Count all original groups, including consumed ones:
+                # an earlier attributed receipt cannot disambiguate this receipt.
+                filtered.append(msg)
+                continue
+            candidate_groups = alias_groups - matched_tool_groups
             if result_variants and not candidate_groups:
                 repairs += 1
                 continue

@@ -87,3 +87,32 @@ def test_same_response_shared_uid_retains_shared_occurrence_semantics():
         {"role": "tool", "tool_call_id": "same-provider-id", "_tool_call_uid": uid, "content": "receipt"},
     ]
     assert canonicalize_replay_history(history, now=100) == history
+
+
+@pytest.mark.parametrize("second_uid", ["b" * 32, None])
+@pytest.mark.parametrize("first_already_answered", [False, True])
+def test_unattributed_receipt_never_consumes_a_stored_occurrence(second_uid, first_already_answered):
+    from agent.agent_runtime_helpers import repair_message_sequence
+
+    first_uid = "a" * 32
+    history = [
+        {"role": "assistant", "tool_calls": [call("first"), call("second")],
+         "_tool_call_uids": {"same-provider-id": [first_uid, second_uid]}},
+    ]
+    if first_already_answered:
+        history.append({"role": "tool", "tool_call_id": "same-provider-id",
+                        "_tool_call_uid": first_uid, "content": "identified first receipt"})
+    history.append({"role": "tool", "tool_call_id": "same-provider-id",
+                    "content": "unattributed receipt"})
+    frozen = copy.deepcopy(history)
+    canonical = canonicalize_replay_history(history, now=100)
+    expected_uids = [second_uid] if first_already_answered else [first_uid, second_uid]
+    assert [r.get("_tool_call_uid") for r in canonical
+            if r.get("effect_disposition") == "unknown"] == expected_uids
+    repaired = copy.deepcopy(canonical)
+    repair_message_sequence(None, repaired)
+    assert repaired == canonical
+    repair_message_sequence(None, repaired)
+    assert repaired == canonical
+    assert canonicalize_replay_history(repaired, now=100) == canonical
+    assert history == frozen
