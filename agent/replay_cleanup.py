@@ -118,30 +118,69 @@ def strip_interrupted_tool_tails(agent_history: List[Dict[str, Any]]) -> List[Di
 
 
 def strip_dangling_tool_call_tail(agent_history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Strip a trailing ``assistant(tool_calls)`` with NO answers — a call that killed the gateway itself
-    (``docker restart``) left zero ``tool`` rows, invisible to ``strip_interrupted_tool_tails``. A partially
-    answered block still resumes. Read-only tails are dropped; side-effecting ones get UNKNOWN-effect results.
+    """Close unanswered replay blocks, including partial blocks and queued-user gaps.
 
-    On resume the model sees an unanswered tool call at the tail and naturally re-issues it — which restarts
-    the gateway again, producing the infinite reboot loop in #49201. ``strip_interrupted_tool_tails`` does
-    not catch this because there is no tool result to inspect for an interrupt marker.
+    Keep the historical entry-point name for callers. Completed blocks are verbatim;
+    wholly unanswered read-only blocks may still be dropped. Otherwise preserve all
+    attempted calls and real results, appending per-call recovery notices inside the
+    original block, before any following user message. These are not success receipts.
     """
-    if not agent_history:
-        return agent_history
-    last = agent_history[-1]
-    if not (isinstance(last, dict) and last.get("role") == "assistant" and last.get("tool_calls")):
-        return agent_history
-    tool_calls = last.get("tool_calls") or []
-    if _any_side_effecting(tool_calls):
-        recovered = list(agent_history)
-        for call in tool_calls:
-            name = _call_name(call) or "unknown"
-            disposition, content = _orphan_recovery(name, _DANGLING_NOTICES)
-            recovered.append(make_tool_result_message(name, content, _call_id(call), effect_disposition=disposition))
-        logger.warning("Recovered dangling side-effecting tool call(s) as UNKNOWN instead of erasing them")
-        return recovered
-    logger.debug("Stripping dangling unanswered read-only assistant(tool_calls) tail (%d call(s))", len(tool_calls))
-    return agent_history[:-1]
+    from agent.message_sanitization import (
+        coalesce_tool_call_id, tool_call_id_variants, tool_result_id_variants,
+    )
+    from agent.message_metadata import index_tool_call_uids, resolve_tool_call_uid
+
+    changed = False
+    if any(a.get("role") == b.get("role") == "assistant"
+           for a, b in zip(agent_history, agent_history[1:])):
+        # Alternation repair already folds these rows before matching results.
+        # Preserve that union/occurrence-UID behavior, but do not prune calls yet
+        # or mutate the caller's history while folding.
+        from copy import deepcopy
+        from agent.agent_runtime_helpers import _merge_consecutive_assistants
+        folded, repairs = _merge_consecutive_assistants(deepcopy(agent_history))
+        if repairs:
+            agent_history = folded
+            changed = True
+    cleaned: List[Dict[str, Any]] = []
+    i = 0
+    while i < len(agent_history):
+        owner = agent_history[i]
+        calls = owner.get("tool_calls") if owner.get("role") == "assistant" else None
+        if not calls:
+            cleaned.append(owner)
+            i += 1
+            continue
+        j = i + 1
+        while j < len(agent_history) and agent_history[j].get("role") == "tool":
+            j += 1
+        results = agent_history[i + 1:j]
+        answered = set().union(*(tool_result_id_variants(result.get("tool_call_id"))
+                                 for result in results))
+        missing = [call for call in calls if not tool_call_id_variants(call) & answered]
+        if not missing:
+            cleaned.extend(agent_history[i:j])
+        elif not results and not _any_side_effecting(calls):
+            changed = True
+            logger.debug("Stripping wholly unanswered read-only replay block")
+        else:
+            changed = True
+            cleaned.extend(agent_history[i:j])
+            uids: Dict[str, str] = {}
+            index_tool_call_uids(uids, owner)
+            for call in missing:
+                call_id = coalesce_tool_call_id(call)
+                name = _call_name(call) or "unknown"
+                disposition, content = _orphan_recovery(name, _DANGLING_NOTICES)
+                notice = make_tool_result_message(
+                    name, content, call_id, effect_disposition=disposition)
+                uid = resolve_tool_call_uid(uids, call_id)
+                if uid is not None:
+                    notice["_tool_call_uid"] = uid
+                cleaned.append(notice)
+            logger.warning("Recovered unanswered replay call(s) with per-call effect notices")
+        i = j
+    return cleaned if changed else agent_history
 
 
 def sanitize_replay_history(agent_history: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
