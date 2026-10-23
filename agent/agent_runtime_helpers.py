@@ -513,8 +513,10 @@ def _drop_stray_tool_results(messages: List[Dict]) -> Tuple[List[Dict], int]:
     """Pass 1: drop tool results not following a known assistant tool call. Consumes the whole
     alias group (call_id/id/response_item_id/composite) so a duplicate keyed on a sibling
     alias is not replayed to strict providers."""
+    from agent.message_metadata import tool_call_occurrence_uids
+
     repairs = 0
-    known_tool_ids: Dict[str, int] = {}  # alias -> group id; reset by assistant/user turns
+    known_tool_ids: Dict[tuple, int] = {}  # (alias, occurrence uid) -> group id
     # Pass 1: drop stray tool messages that don't follow a known assistant tool call. A Responses call can
     # have several equivalent spellings (call_id, id, response_item_id, or a composite ``call|item`` id), so
     # consume the whole alias group when one spelling is matched. Alias expansion lives in
@@ -530,17 +532,28 @@ def _drop_stray_tool_results(messages: List[Dict]) -> Tuple[List[Dict], int]:
             # messages are orphans).
             known_tool_ids = {}
             matched_tool_groups = set()
-            for tc in (msg.get("tool_calls") or []) if role == "assistant" else ():
+            calls = (msg.get("tool_calls") or []) if role == "assistant" else []
+            for tc, uid in zip(calls, tool_call_occurrence_uids(msg)):
                 variants = tool_call_id_variants(tc)
                 if variants:
                     for tc_id in variants:
-                        known_tool_ids.setdefault(tc_id, next_tool_group)
+                        known_tool_ids.setdefault((tc_id, uid), next_tool_group)
                     next_tool_group += 1
         elif role == "tool":
             result_variants = tool_result_id_variants(msg.get("tool_call_id"))
+            uid = msg.get("_tool_call_uid")
+            if not uid and msg.get("effect_disposition") == "unknown" and any(
+                call_uid is None and tc_id in result_variants
+                for tc_id, call_uid in known_tool_ids
+            ):
+                # An unidentified recovery notice is uncertainty, not a duplicate
+                # receipt. Alias consumption cannot disprove a legacy attempt.
+                filtered.append(msg)
+                continue
             candidate_groups = {
-                known_tool_ids[tc_id] for tc_id in result_variants
-                if tc_id in known_tool_ids and known_tool_ids[tc_id] not in matched_tool_groups
+                group for (tc_id, call_uid), group in known_tool_ids.items()
+                if tc_id in result_variants and (not uid or call_uid == uid)
+                and group not in matched_tool_groups
             }
             if result_variants and not candidate_groups:
                 repairs += 1

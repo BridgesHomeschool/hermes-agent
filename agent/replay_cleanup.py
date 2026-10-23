@@ -128,7 +128,7 @@ def strip_dangling_tool_call_tail(agent_history: List[Dict[str, Any]]) -> List[D
     from agent.message_sanitization import (
         coalesce_tool_call_id, tool_call_id_variants, tool_result_id_variants,
     )
-    from agent.message_metadata import index_tool_call_uids, resolve_tool_call_uid
+    from agent.message_metadata import tool_call_occurrence_uids
 
     changed = False
     if any(a.get("role") == b.get("role") == "assistant"
@@ -155,9 +155,29 @@ def strip_dangling_tool_call_tail(agent_history: List[Dict[str, Any]]) -> List[D
         while j < len(agent_history) and agent_history[j].get("role") == "tool":
             j += 1
         results = agent_history[i + 1:j]
-        answered = set().union(*(tool_result_id_variants(result.get("tool_call_id"))
-                                 for result in results))
-        missing = [call for call in calls if not tool_call_id_variants(call) & answered]
+        uids = tool_call_occurrence_uids(owner)
+        variants = [tool_call_id_variants(call) for call in calls]
+        answered = set()
+        for result in results:
+            aliases = tool_result_id_variants(result.get("tool_call_id"))
+            candidates = [k for k, ids in enumerate(variants) if ids & aliases]
+            result_uid = result.get("_tool_call_uid")
+            if result_uid:
+                answered.update(k for k in candidates if uids[k] == result_uid)
+            elif len(candidates) == 1 or (
+                candidates and uids[candidates[0]] is not None
+                and len({uids[k] for k in candidates}) == 1
+            ):
+                # Legacy alias-only results can close an unambiguous call (or
+                # slots deliberately sharing one native occurrence), not siblings.
+                answered.update(candidates)
+            elif result.get("effect_disposition") in {"unknown", "none"}:
+                # Our identity-less notices are not receipts. Count them one per
+                # unidentified slot so conservative legacy recovery is idempotent.
+                pending = [k for k in candidates if uids[k] is None and k not in answered]
+                if pending:
+                    answered.add(pending[0])
+        missing = [k for k in range(len(calls)) if k not in answered]
         if not missing:
             cleaned.extend(agent_history[i:j])
         elif not results and not _any_side_effecting(calls):
@@ -166,15 +186,14 @@ def strip_dangling_tool_call_tail(agent_history: List[Dict[str, Any]]) -> List[D
         else:
             changed = True
             cleaned.extend(agent_history[i:j])
-            uids: Dict[str, str] = {}
-            index_tool_call_uids(uids, owner)
-            for call in missing:
+            for k in missing:
+                call = calls[k]
                 call_id = coalesce_tool_call_id(call)
                 name = _call_name(call) or "unknown"
                 disposition, content = _orphan_recovery(name, _DANGLING_NOTICES)
                 notice = make_tool_result_message(
                     name, content, call_id, effect_disposition=disposition)
-                uid = resolve_tool_call_uid(uids, call_id)
+                uid = uids[k]
                 if uid is not None:
                     notice["_tool_call_uid"] = uid
                 cleaned.append(notice)

@@ -163,6 +163,28 @@ def per_occurrence_tool_call_uids(uids: Mapping[str, Any], tool_calls: List[Mapp
     return expanded
 
 
+def tool_call_occurrence_uids(assistant: Mapping[str, Any]) -> list:
+    """Stored uid for each call slot, including folded occurrence vectors; never mint one.
+
+    A scalar deliberately applies to every same-id slot in a single response. Missing
+    vector entries remain unidentified rather than borrowing a sibling's identity.
+    """
+    from agent.message_sanitization import coalesce_tool_call_id
+
+    uids = assistant.get(TOOL_CALL_UIDS)
+    uids = uids if isinstance(uids, dict) else {}
+    occurrence: dict = {}
+    resolved = []
+    for call in assistant.get("tool_calls") or ():
+        call_id = coalesce_tool_call_id(call)
+        uid = uids.get(call_id)
+        if isinstance(uid, list):
+            nth = occurrence[call_id] = occurrence.get(call_id, -1) + 1
+            uid = uid[nth] if nth < len(uid) else None
+        resolved.append(uid if isinstance(uid, str) and uid else None)
+    return resolved
+
+
 def index_tool_call_uids(index: MutableMapping[str, str], assistant: Mapping[str, Any]) -> frozenset:
     """Register an assistant dict's ``_tool_call_uids`` under every pairing-id variant of its tool calls, so a
     later tool-result row can be resolved by any spelling of its ``tool_call_id``. Provider ids repeat, so
@@ -179,14 +201,8 @@ def index_tool_call_uids(index: MutableMapping[str, str], assistant: Mapping[str
     uids = assistant.get(TOOL_CALL_UIDS)
     if not isinstance(uids, dict) or not uids:
         return named
-    occurrence: dict = {}  # provider id -> calls seen so far: a list value holds one uid per occurrence
-    for tc, variants in calls:
-        call_id = coalesce_tool_call_id(tc)
-        uid = uids.get(call_id)
-        if isinstance(uid, list):
-            nth = occurrence[call_id] = occurrence.get(call_id, -1) + 1
-            uid = uid[nth] if nth < len(uid) else None
-        if isinstance(uid, str) and uid:
+    for (_, variants), uid in zip(calls, tool_call_occurrence_uids(assistant)):
+        if uid is not None:
             for variant in variants:
                 index[variant] = uid
     return named
