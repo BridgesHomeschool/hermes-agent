@@ -1721,6 +1721,11 @@ class SessionMessagesMixin:
         # session_id) plus its curator reply, and bare tool-call marker content ("[memory]") persisted as an answer.
         messages = _strip_stale_tool_call_markers(_strip_background_review_harness(messages))
         if repair_alternation and messages:
+            # Recover a crashed side-effecting tail BEFORE alternation repair can
+            # erase the unanswered call and its stable retry/provenance arguments.
+            # The recovery notice describes an UNKNOWN effect, never a receipt.
+            from agent.replay_cleanup import canonicalize_replay_history
+            messages = canonicalize_replay_history(messages)
             from agent.agent_runtime_helpers import repair_message_sequence
             repaired = repair_message_sequence(None, messages)
             if repaired:
