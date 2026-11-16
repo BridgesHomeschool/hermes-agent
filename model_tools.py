@@ -19,7 +19,7 @@ import time
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import CHECK_FN_CACHE_BYPASS, check_fn_cache_scope, discover_builtin_tools, registry, tool_error
-from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
+from tools.registry import _CHECK_FN_TTL_SECONDS, _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
 from toolsets import resolve_toolset, validate_toolset
 from tools.arg_coercion import coerce_tool_args
 from tools.todo_tool import TODO_LEGACY_ALIASES, TODO_SCHEMA
@@ -193,7 +193,8 @@ _LEGACY_TOOLSET_MAP = {
 # non-quiet path prints). Hot callers (gateway runner, AIAgent.__init__) hit it
 # every turn; a miss costs ~7 ms of registry walk + check_fn probing. The key
 # includes registry._generation (bumped on register/deregister/alias) so
-# invalidation is transparent; check_fn drift is handled by registry.py's 30 s TTL.
+# invalidation is transparent. A TTL bucket also lets registry.py re-probe check_fn
+# drift; otherwise a memo hit would bypass its availability TTL indefinitely.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 _tool_defs_cache_lock = threading.Lock()
 # FIFO cap: 8 covers a long-lived gateway's warm set of platform/toolset combos.
@@ -260,7 +261,10 @@ def _tool_defs_cache_key(
 
     Covers every argument plus everything that changes the result without one:
     registry generation, config.yaml stat signature (dynamic schemas), kanban
-    context, profile scope. check_fn results are TTL-cached in the registry.
+    context, profile scope, availability TTL. This memo must expire too: hits
+    never reach the registry's TTL-cached check_fn probes. Only newly requested
+    definitions change; existing agents retain their frozen tool schemas.
+    The two TTL layers can delay availability changes by up to two intervals.
     """
     profile_scope = check_fn_cache_scope()
     if profile_scope == CHECK_FN_CACHE_BYPASS:
@@ -276,6 +280,7 @@ def _tool_defs_cache_key(
         frozenset(disabled_toolsets) if disabled_toolsets else None, registry._generation, cfg_fp,
         bool(os.environ.get("HERMES_KANBAN_TASK")), bool(skip_tool_search_assembly),
         _is_delegated_child_context(), _is_dispatcher_owned_worker(), profile_scope,
+        int(time.monotonic() // _CHECK_FN_TTL_SECONDS),
     )
 
 
